@@ -1,6 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using System.Diagnostics;
+using System.IO.Compression;
 using Stockfish.NET.Exceptions;
 using Stockfish.NET.Models;
 
@@ -8,406 +7,258 @@ namespace Stockfish.NET.Core
 {
     public class Stockfish : IStockfish
     {
-        #region private variables
+        private const int MaxTries = 200;
+        private const string StockfishText = "stockfish";
+        private const string StockfishFile = "stockfish-windows-x86-64-avx2.exe";
 
-        /// <summary>
-        /// 
-        /// </summary>
-        private const int MAX_TRIES = 200;
+        private static readonly string StockfishLocalDirectory = Path.Combine(Path.GetTempPath(), StockfishText);
 
-        /// <summary>
-        /// 
-        /// </summary>
-        private int _skillLevel;
+        private int mDepth;
 
-        #endregion
-
-        # region private properties
-
-        /// <summary>
-        /// 
-        /// </summary>
-        private StockfishProcess _stockfish { get; set; }
-
-        #endregion
-
-        #region public properties
-
-        /// <summary>
-        /// 
-        /// </summary>
         public Settings Settings { get; set; }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        public int Depth { get; set; }
+        private string StockfishFileLocation { get; set; } = string.Empty;
 
-        /// <summary>
-        /// 
-        /// </summary>
-        public int SkillLevel
+        public static void Dispose()
         {
-            get => _skillLevel;
-            set
+            if (File.Exists(StockfishLocalDirectory))
             {
-                _skillLevel = value;
-                Settings.SkillLevel = SkillLevel;
-                setOption("Skill level", SkillLevel.ToString());
+                Directory.Delete(StockfishLocalDirectory);
             }
         }
 
-        #endregion
-
-        # region constructor
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="path"></param>
-        /// <param name="depth"></param>
-        /// <param name="settings"></param>
-        public Stockfish(
-            string path,
-            int depth = 2,
-            Settings settings = null)
+        ~Stockfish()
         {
-            Depth = depth;
-            _stockfish = new StockfishProcess(path);
-            _stockfish.Start();
-            _stockfish.ReadLine();
-
-            if (settings == null)
-            {
-                Settings = new Settings();
-            }
-            else
-            {
-                Settings = settings;
-            }
-
-            SkillLevel = Settings.SkillLevel;
-            foreach (var property in Settings.GetPropertiesAsDictionary())
-            {
-                setOption(property.Key, property.Value);
-            }
-
-            startNewGame();
+            Dispose();
         }
 
-        #endregion
-
-        #region private
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="command"></param>
-        /// <param name="estimatedTime"></param>
-        private void send(string command, int estimatedTime = 100)
+        //Evaluation
+        //Best Move
+        private async void DownloadStockfish()
         {
-            _stockfish.WriteLine(command);
-            _stockfish.Wait(estimatedTime);
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-		private bool isReady()
-        {
-			send("isready");
-			var tries = 0;
-			while (tries < MAX_TRIES) {
-				++tries;
-
-				if (_stockfish.ReadLine() == "readyok") {
-					return true;
-				}
-			}
-			throw new MaxTriesException();
-		}
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="name"></param>
-        /// <param name="value"></param>
-        /// <exception cref="ApplicationException"></exception>
-        private void setOption(string name, string value)
-        {
-            send($"setoption name {name} value {value}");
-            if (!isReady())
+            if (!string.IsNullOrEmpty(StockfishFileLocation))
             {
-                throw new ApplicationException();
+                return;
+            }
+
+            bool finished = await DownloadAndUnzip(
+                "https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-windows-x86-64-avx2.zip",
+                StockfishLocalDirectory);
+
+            if (finished)
+            {
+                StockfishFileLocation = Path.Combine(StockfishLocalDirectory, StockfishText, StockfishFile);
             }
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="moves"></param>
-        /// <returns></returns>
-        private string movesToString(string[] moves)
+        private static async Task<bool> DownloadAndUnzip(string requestUri, string directoryToUnzip)
         {
-            return string.Join(" ", moves);
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <exception cref="ApplicationException"></exception>
-        private void startNewGame()
-        {
-            send("ucinewgame");
-            if (!isReady())
+            using HttpResponseMessage response = await new HttpClient().GetAsync(requestUri);
+            if (!response.IsSuccessStatusCode)
             {
-                throw new ApplicationException();
+                return false;
             }
+
+            await using Stream streamToReadFrom = await response.Content.ReadAsStreamAsync();
+            using ZipArchive zip = new(streamToReadFrom);
+            zip.ExtractToDirectory(directoryToUnzip);
+
+            return true;
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        private void go()
+        private static Task<int> RunProcessAsync(Process process)
         {
-            send($"go depth {Depth}");
+            TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
+
+            process.Exited += (s, ea) => tcs.SetResult(process.ExitCode);
+            process.OutputDataReceived += (s, ea) => Console.WriteLine(ea.Data);
+            process.ErrorDataReceived += (s, ea) => Console.WriteLine("ERR: " + ea.Data);
+
+            bool started = process.Start();
+            if (!started)
+            {
+                //you may allow for the process to be re-used (started = false) 
+                //but I'm not sure about the guarantees of the Exited event in such a case
+                throw new InvalidOperationException("Could not start process: " + process);
+            }
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            return tcs.Task;
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="time"></param>
-        private void goTime(int time)
+        public Stockfish(int depth = 2, Settings? settings = null)
         {
-            send($"go movetime {time}", estimatedTime: time + 100);
+            mDepth = depth;
+            Settings = settings ?? new Settings();
+
+            DownloadStockfish();
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        private List<string> readLineAsList()
+        public Stockfish(string path, int depth = 2, Settings? settings = null)
         {
-            var data = _stockfish.ReadLine();
-            return data.Split(' ').ToList();
+            mDepth = depth;
+            StockfishFileLocation = path;
         }
 
-        #endregion
-
-        #region public
-
-        /// <summary>
-        /// Setup current position
-        /// </summary>
-        /// <param name="moves"></param>
-        public void SetPosition(params string[] moves)
+        private void Send(string command, Process process)
         {
-            startNewGame();
-            send($"position startpos moves {movesToString(moves)}");
+            WriteLine(process, command);
         }
 
-        /// <summary>
-        /// Get visualisation of current position
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public string GetBoardVisual()
+        private bool IsReady(Process process)
         {
-            send("d");
-            var board = "";
-            var lines = 0;
+            Send("isready", process);
             var tries = 0;
-            while (lines < 17)
+            while (tries < MaxTries)
             {
-                if (tries > MAX_TRIES)
+                ++tries;
+
+                if (ReadLine(process) == "readyok")
                 {
-                    throw new MaxTriesException();
-                }
-
-                var data = _stockfish.ReadLine();
-                if (data.Contains("+") || data.Contains("|"))
-                {
-                    lines++;
-                    board += $"{data}\n";
-                }
-
-                tries++;
-            }
-
-            return board;
-        }
-
-        /// <summary>
-        /// Get position in fen format
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public string GetFenPosition()
-        {
-            send("d");
-            var tries = 0;
-            while (true)
-            {
-                if (tries > MAX_TRIES)
-                {
-                    throw new MaxTriesException();
-                }
-
-                var data = readLineAsList();
-                if (data[0] == "Fen:")
-                {
-                    return string.Join(" ", data.GetRange(1, data.Count - 1));
-                }
-
-                tries++;
-            }
-        }
-
-        /// <summary>
-        /// Set position in fen format
-        /// </summary>
-        /// <param name="fenPosition"></param>
-        public void SetFenPosition(string fenPosition)
-        {
-            startNewGame();
-            send($"position fen {fenPosition}");
-        }
-
-        /// <summary>
-        /// Getting best move of current position
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public string GetBestMove()
-        {
-            go();
-            var tries = 0;
-            while (true)
-            {
-                if (tries > MAX_TRIES)
-                {
-                    throw new MaxTriesException();
-                }
-
-                var data = readLineAsList();
-
-                if (data[0] == "bestmove")
-                {
-                    if (data[1] == "(none)")
-                    {
-                        return null;
-                    }
-
-                    return data[1];
-                }
-
-                tries++;
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="time"></param>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public string GetBestMoveTime(int time = 1000)
-        {
-            goTime(time);
-            var tries = 0;
-            while (true)
-            {
-                if (tries > MAX_TRIES)
-                {
-                    throw new MaxTriesException();
-                }
-
-                var data = readLineAsList();
-                if (data[0] == "bestmove")
-                {
-                    if (data[1] == "(none)")
-                    {
-                        return null;
-                    }
-
-                    return data[1];
-                }
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="moveValue"></param>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public bool IsMoveCorrect(string moveValue)
-        {
-            send($"go depth 1 searchmoves {moveValue}");
-            var tries = 0;
-            while (true)
-            {
-                if (tries > MAX_TRIES)
-                {
-                    throw new MaxTriesException();
-                }
-
-                var data = readLineAsList();
-                if (data[0] == "bestmove")
-                {
-                    if (data[1] == "(none)")
-                    {
-                        return false;
-                    }
-
                     return true;
                 }
+            }
+            throw new MaxTriesException();
+        }
 
-                tries++;
+        private void SetOption(string name, string value, Process process)
+        {
+            Send($"setoption name {name} value {value}", process);
+            if (!IsReady(process))
+            {
+                throw new ApplicationException();
             }
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="MaxTriesException"></exception>
-        public Evaluation GetEvaluation()
+        private void StartGame(Process process)
         {
-            Evaluation evaluation = new Evaluation();
-            var fen = GetFenPosition();
-            Color compare;
-            // fen sequence for white always contains w
-            if (fen.Contains("w"))
+            Send("ucinewgame", process);
+            if (!IsReady(process))
             {
-                compare = Color.White;
+                throw new ApplicationException();
             }
-            else
+        }
+
+        public void StartFenGame(string fenPosition, Process process)
+        {
+            StartGame(process);
+            Send($"position fen {fenPosition}", process);
+            Send($"go depth {mDepth}", process);
+        }
+
+        private void SetThreads(int workingThreads, Process process)
+        {
+            SetOption("threads", $"{workingThreads - 1}", process);
+        }
+
+        public void WriteLine(Process process, string command)
+        {
+            if (process.StandardInput == null)
             {
-                compare = Color.Black;
+                throw new NullReferenceException();
+            }
+            process.StandardInput.WriteLine(command);
+            process.StandardInput.Flush();
+        }
+
+        public string ReadLine(Process process)
+        {
+            if (process.StandardOutput == null)
+            {
+                throw new NullReferenceException();
             }
 
-            // I'm not sure this is the good way to handle evaluation of position, but why not?
-            // Another way we need to somehow limit engine depth? 
-            goTime(10000);
-            var tries = 0;
-            while (true)
-            {
-                if (tries > MAX_TRIES)
-                {
-                    throw new MaxTriesException("tries:"+tries+">max-tries:"+MAX_TRIES);
-                }
+            return process.StandardOutput.ReadLine() ?? string.Empty;
+        }
 
-                var data = readLineAsList();
-                if (data[0] == "info")
+        public async Task<string> GetBestMove(string fenPosition)
+        {
+            using Process process = new()
+            {
+                StartInfo =
                 {
-                    for (int i = 0; i < data.Count; i++)
+                    FileName = StockfishFileLocation,
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                },
+                EnableRaisingEvents = true
+            };
+
+            string bestMove = string.Empty;
+
+            process.OutputDataReceived += (s, e) =>
+            {
+                var data = e.Data?.Split(' ').ToList();
+                if (data != null && data.Count != 0)
+                {
+                    if (data[0] == "bestmove")
                     {
-                        if (data[i] == "score")
+                        if (data[1] != "(none)")
                         {
-                            //don't use ternary operator here for readability
+                            bestMove = data[1];
+                        }
+                    }
+                }
+                Console.WriteLine(e.Data);
+            };
+
+            process.ErrorDataReceived += (s, e) =>
+            {
+                Console.WriteLine(e.Data);
+            };
+
+            await RunProcessAsync(process).ConfigureAwait(false);
+
+            ReadLine(process);
+
+            ThreadPool.GetAvailableThreads(out int workingThreads, out int _);
+            SetThreads(workingThreads, process);
+
+            SetOption("Skill level", Settings.SkillLevel.ToString(), process);
+            foreach (var property in Settings.GetPropertiesAsDictionary())
+            {
+                SetOption(property.Key, property.Value, process);
+            }
+
+            StartFenGame(fenPosition, process);
+
+            return bestMove;
+        }
+
+        public async Task<double> GetEvaluation(string fenPosition)
+        {
+            using Process process = new()
+            {
+                StartInfo =
+                {
+                    FileName = StockfishFileLocation,
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                },
+                EnableRaisingEvents = true
+            };
+
+            double evaluation = double.NaN;
+            double finalEvaluation = double.NaN;
+            Color compare =
+                fenPosition.Contains("w") ? Color.White : Color.Black;
+
+            process.OutputDataReceived += (s, e) =>
+            {
+                var data = e.Data?.Split(' ').ToList();
+                if (data != null && data.Count != 0)
+                {
+                    if (data[0] == "info")
+                    {
+                        for (int i = 0; i < data.Count; i++)
+                        {
+                            if (data[i] != "score")
+                            {
+                                continue;
+                            }
+
                             int k;
                             if (compare == Color.White)
                             {
@@ -418,20 +269,38 @@ namespace Stockfish.NET.Core
                                 k = -1;
                             }
 
-                            evaluation = new Evaluation(data[i + 1], Convert.ToInt32(data[i + 2]) * k);
+                            evaluation = Convert.ToDouble(data[i + 2]) * k;
                         }
                     }
+                    if (data[0] == "bestmove")
+                    {
+                        finalEvaluation = evaluation;
+                    }
                 }
+                Console.WriteLine(e.Data);
+            };
 
-                if (data[0] == "bestmove")
-                {
-                    return evaluation;
-                }
+            process.ErrorDataReceived += (s, e) =>
+            {
+                Console.WriteLine(e.Data);
+            };
 
-                tries++;
+            await RunProcessAsync(process).ConfigureAwait(false);
+
+            ReadLine(process);
+
+            ThreadPool.GetAvailableThreads(out int workingThreads, out int _);
+            SetThreads(workingThreads, process);
+
+            SetOption("Skill level", Settings.SkillLevel.ToString(), process);
+            foreach (var property in Settings.GetPropertiesAsDictionary())
+            {
+                SetOption(property.Key, property.Value, process);
             }
-        }
 
-        #endregion
+            StartFenGame(fenPosition, process);
+
+            return finalEvaluation;
+        }
     }
 }
