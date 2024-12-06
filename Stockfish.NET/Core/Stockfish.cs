@@ -1,30 +1,24 @@
 ﻿using System.Diagnostics;
-using System.IO.Compression;
-using Stockfish.NET.Exceptions;
 using Stockfish.NET.Models;
 
 namespace Stockfish.NET.Core
 {
-    public class Stockfish : IStockfish
+    public class Stockfish : IStockfish, IDisposable
     {
-        private const int MaxTries = 200;
-        private const string StockfishText = "stockfish";
-        private const string StockfishFile = "stockfish-windows-x86-64-avx2.exe";
+        //private static readonly StringBuilder mStockfishOutput = null;
 
-        private static readonly string StockfishLocalDirectory = Path.Combine(Path.GetTempPath(), StockfishText);
 
-        private int mDepth;
+        private static int mDepth = 2;
 
-        public Settings Settings { get; set; }
+        public required Settings Settings { get; set; }
 
         private string StockfishFileLocation { get; set; } = string.Empty;
 
-        public static void Dispose()
+        private readonly IStockfishDownloader mStockfishDownloader;
+
+        public void Dispose()
         {
-            if (File.Exists(StockfishLocalDirectory))
-            {
-                Directory.Delete(StockfishLocalDirectory);
-            }
+            mStockfishDownloader.Dispose();
         }
 
         ~Stockfish()
@@ -32,199 +26,143 @@ namespace Stockfish.NET.Core
             Dispose();
         }
 
-        //Evaluation
-        //Best Move
-        private async void DownloadStockfish()
-        {
-            if (!string.IsNullOrEmpty(StockfishFileLocation))
-            {
-                return;
-            }
-
-            bool finished = await DownloadAndUnzip(
-                "https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-windows-x86-64-avx2.zip",
-                StockfishLocalDirectory);
-
-            if (finished)
-            {
-                StockfishFileLocation = Path.Combine(StockfishLocalDirectory, StockfishText, StockfishFile);
-            }
-        }
-
-        private static async Task<bool> DownloadAndUnzip(string requestUri, string directoryToUnzip)
-        {
-            using HttpResponseMessage response = await new HttpClient().GetAsync(requestUri);
-            if (!response.IsSuccessStatusCode)
-            {
-                return false;
-            }
-
-            await using Stream streamToReadFrom = await response.Content.ReadAsStreamAsync();
-            using ZipArchive zip = new(streamToReadFrom);
-            zip.ExtractToDirectory(directoryToUnzip);
-
-            return true;
-        }
-
-        private static Task<int> RunProcessAsync(Process process)
-        {
-            TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
-
-            process.Exited += (s, ea) => tcs.SetResult(process.ExitCode);
-            process.OutputDataReceived += (s, ea) => Console.WriteLine(ea.Data);
-            process.ErrorDataReceived += (s, ea) => Console.WriteLine("ERR: " + ea.Data);
-
-            bool started = process.Start();
-            if (!started)
-            {
-                //you may allow for the process to be re-used (started = false) 
-                //but I'm not sure about the guarantees of the Exited event in such a case
-                throw new InvalidOperationException("Could not start process: " + process);
-            }
-
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            return tcs.Task;
-        }
-
         public Stockfish(int depth = 2, Settings? settings = null)
         {
             mDepth = depth;
             Settings = settings ?? new Settings();
-
-            DownloadStockfish();
         }
+
+        //IsGameOverOrIllegal
 
         public Stockfish(string path, int depth = 2, Settings? settings = null)
         {
             mDepth = depth;
             StockfishFileLocation = path;
+            Settings = settings ?? new Settings();
         }
 
-        private void Send(string command, Process process)
+        public async Task SetOption(string name, string value, StreamWriter input)
         {
-            WriteLine(process, command);
+            await WriteLine($"setoption name {name} value {value}", input);
         }
 
-        private bool IsReady(Process process)
+        public async Task StartFenGame(string fenPosition, StreamWriter input)
         {
-            Send("isready", process);
-            var tries = 0;
-            while (tries < MaxTries)
+            await WriteLine("ucinewgame", input);
+            await WriteLine($"position fen {fenPosition}", input);
+            await WriteLine($"go depth {mDepth}", input);
+        }
+
+        public async Task WriteLine(string command, StreamWriter input)
+        {
+            await input.WriteLineAsync(command);
+        }
+
+        public async Task EvaluateFen(string fenPosition, TaskCompletionSource<FenError> fenParsing)
+        {
+            FenParser fenParser = new();
+
+            async Task OnFenParserOnFenParsed(object source, FenError fenArgs)
             {
-                ++tries;
-
-                if (ReadLine(process) == "readyok")
+                await Task.Factory.StartNew(async state =>
                 {
-                    return true;
-                }
-            }
-            throw new MaxTriesException();
-        }
+                    var result = (FenError)(state is FenError ? state : FenError.Unread);
 
-        private void SetOption(string name, string value, Process process)
-        {
-            Send($"setoption name {name} value {value}", process);
-            if (!IsReady(process))
-            {
-                throw new ApplicationException();
-            }
-        }
-
-        private void StartGame(Process process)
-        {
-            Send("ucinewgame", process);
-            if (!IsReady(process))
-            {
-                throw new ApplicationException();
-            }
-        }
-
-        public void StartFenGame(string fenPosition, Process process)
-        {
-            StartGame(process);
-            Send($"position fen {fenPosition}", process);
-            Send($"go depth {mDepth}", process);
-        }
-
-        private void SetThreads(int workingThreads, Process process)
-        {
-            SetOption("threads", $"{workingThreads - 1}", process);
-        }
-
-        public void WriteLine(Process process, string command)
-        {
-            if (process.StandardInput == null)
-            {
-                throw new NullReferenceException();
-            }
-            process.StandardInput.WriteLine(command);
-            process.StandardInput.Flush();
-        }
-
-        public string ReadLine(Process process)
-        {
-            if (process.StandardOutput == null)
-            {
-                throw new NullReferenceException();
+                    fenParsing.SetResult(result);
+                }, fenArgs);
             }
 
-            return process.StandardOutput.ReadLine() ?? string.Empty;
+            fenParser.FenParsed += OnFenParserOnFenParsed; 
+            
+            await fenParser.ParseFen(fenPosition);
         }
 
         public async Task<string> GetBestMove(string fenPosition)
         {
+            TaskCompletionSource<FenError> fenParsing = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            
+            await EvaluateFen(fenPosition, fenParsing);
+
+            var fenParsedError = await fenParsing.Task;
+
+            TaskCompletionSource<string> evaluationCompletion = new();
+
             using Process process = new()
             {
                 StartInfo =
                 {
                     FileName = StockfishFileLocation,
                     UseShellExecute = false, CreateNoWindow = true,
-                    RedirectStandardOutput = true, RedirectStandardError = true
+                    RedirectStandardOutput = true, RedirectStandardError = true,
+                    RedirectStandardInput = true
                 },
                 EnableRaisingEvents = true
             };
 
-            string bestMove = string.Empty;
-
             process.OutputDataReceived += (s, e) =>
             {
-                var data = e.Data?.Split(' ').ToList();
-                if (data != null && data.Count != 0)
+                if (string.IsNullOrEmpty(e.Data))
                 {
-                    if (data[0] == "bestmove")
-                    {
-                        if (data[1] != "(none)")
-                        {
-                            bestMove = data[1];
-                        }
-                    }
+                    return;
                 }
-                Console.WriteLine(e.Data);
+
+                if (!e.Data.StartsWith("bestmove", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                List<string>? data = e.Data?.Split(' ').ToList();
+                if (data == null || data.Count == 0)
+                {
+                    return;
+                }
+
+                if (data[0] != "bestmove")
+                {
+                    return;
+                }
+
+                if (data[1] == "(none)")
+                {
+                    return;
+                }
+
+                evaluationCompletion.SetResult(data[1]);
             };
 
             process.ErrorDataReceived += (s, e) =>
             {
-                Console.WriteLine(e.Data);
+                Console.WriteLine("Error : " + e.Data);
             };
 
-            await RunProcessAsync(process).ConfigureAwait(false);
+            switch (fenParsedError)
+            {
+                case FenError.Bad:
+                    return FenError.Bad.ToStringByAttributes();
+                case FenError.Mate:
+                    return FenError.Mate.ToStringByAttributes();
+                case FenError.Okay:
+                    break;
+                case FenError.Unread:
+                    break;
+            }
+        
+            process.Start();
 
-            ReadLine(process);
+            StreamWriter sortStream = process.StandardInput;
 
-            ThreadPool.GetAvailableThreads(out int workingThreads, out int _);
-            SetThreads(workingThreads, process);
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            await process.StandardInput.FlushAsync();
 
-            SetOption("Skill level", Settings.SkillLevel.ToString(), process);
             foreach (var property in Settings.GetPropertiesAsDictionary())
             {
-                SetOption(property.Key, property.Value, process);
+                await SetOption(property.Key, property.Value, sortStream);
             }
 
-            StartFenGame(fenPosition, process);
+            await StartFenGame(fenPosition, sortStream);
 
-            return bestMove;
+            return await evaluationCompletion.Task;
         }
 
         public async Task<double> GetEvaluation(string fenPosition)
@@ -239,6 +177,12 @@ namespace Stockfish.NET.Core
                 },
                 EnableRaisingEvents = true
             };
+            TaskCompletionSource<bool> completion = new TaskCompletionSource<bool>();
+
+
+            //one thread for the error line 
+            //one thread for the output line ? 
+
 
             double evaluation = double.NaN;
             double finalEvaluation = double.NaN;
@@ -285,20 +229,31 @@ namespace Stockfish.NET.Core
                 Console.WriteLine(e.Data);
             };
 
-            await RunProcessAsync(process).ConfigureAwait(false);
+            //You'll wait forever.. beware or be scarewd
+            bool started = process.Start();
+            if (!started)
+            {
+                //you may allow for the process to be re-used (started = false) 
+                //but I'm not sure about the guarantees of the Exited event in such a case
+                throw new InvalidOperationException("Could not start process: " + process);
+            }
+            StreamWriter streamWriter = process.StandardInput;
 
-            ReadLine(process);
+            process.BeginOutputReadLine();
+            //process.BeginErrorReadLine();
+
+            //await ReadLine(process);
 
             ThreadPool.GetAvailableThreads(out int workingThreads, out int _);
-            SetThreads(workingThreads, process);
+            //await SetThreads(workingThreads, streamWriter);
 
-            SetOption("Skill level", Settings.SkillLevel.ToString(), process);
+            await SetOption("Skill level", Settings.SkillLevel.ToString(), streamWriter);
             foreach (var property in Settings.GetPropertiesAsDictionary())
             {
-                SetOption(property.Key, property.Value, process);
+                await SetOption(property.Key, property.Value, streamWriter);
             }
 
-            StartFenGame(fenPosition, process);
+            await StartFenGame(fenPosition, streamWriter);
 
             return finalEvaluation;
         }

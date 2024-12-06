@@ -1,6 +1,4 @@
-﻿using System.Collections.Generic;
-
-namespace Stockfish.NET.Models
+﻿namespace Stockfish.NET.Models
 {
     public class Settings
     {
@@ -10,7 +8,6 @@ namespace Stockfish.NET.Models
         public int MultiPV { get; set; }
         public int SkillLevel { get; set; }
         public int MoveOverhead { get; set; }
-        public int SlowMover { get; set; }
         public bool UCIChess960 { get; set; }
 
         public Settings(
@@ -19,8 +16,7 @@ namespace Stockfish.NET.Models
             bool ponder = false,
             int multiPV = 1,
             int skillLevel = 20,
-            int moveOverhead = 30,
-            int slowMover = 80,
+            int moveOverhead = 10,
             bool uciChess960 = false
         )
         {
@@ -30,7 +26,6 @@ namespace Stockfish.NET.Models
             MultiPV = multiPV;
             SkillLevel = skillLevel;
             MoveOverhead = moveOverhead;
-            SlowMover = slowMover;
             UCIChess960 = uciChess960;
         }
 
@@ -44,7 +39,6 @@ namespace Stockfish.NET.Models
                 ["MultiPV"] = MultiPV.ToString(),
                 ["Skill Level"] = SkillLevel.ToString(),
                 ["Move Overhead"] = MoveOverhead.ToString(),
-                ["Slow Mover"] = SlowMover.ToString(),
                 ["UCI_Chess960"] = UCIChess960.ToString(),
             };
         }

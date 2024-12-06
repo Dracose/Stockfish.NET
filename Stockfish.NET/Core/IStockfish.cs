@@ -1,7 +1,4 @@
-﻿using System.Collections.Generic;
-using Stockfish.NET.Models;
-
-namespace Stockfish.NET
+﻿namespace Stockfish.NET
 {
     public interface IStockfish
     {
